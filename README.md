@@ -1,6 +1,6 @@
 # arXiv PDF Fetcher
 
-This repository contains a single, standalone Python script that:
+This repository contains a single, standalone Python script (`stalker.py`) that:
 
 - Takes two arguments: a `name` and an arXiv search `url`
 - Discovers all arXiv records listed by that search (following pagination)
@@ -19,13 +19,13 @@ This repository contains a single, standalone Python script that:
 Basic:
 
 ```bash
-python3 fetch_arxiv_pdfs.py "Some Name" "https://arxiv.org/search/math?searchtype=author&query=..."
+python3 stalker.py "Some Name" "https://arxiv.org/search/math?searchtype=author&query=..."
 ```
 
 Common options:
 
 ```bash
-python3 fetch_arxiv_pdfs.py "Some Name" "https://arxiv.org/search/..." \
+python3 stalker.py "Some Name" "https://arxiv.org/search/..." \
   --delay 1.0 \
   --page-size 200 \
   --batch-size 50 \
@@ -36,7 +36,35 @@ python3 fetch_arxiv_pdfs.py "Some Name" "https://arxiv.org/search/..." \
 Optional limit (useful for testing):
 
 ```bash
-python3 fetch_arxiv_pdfs.py "Some Name" "https://arxiv.org/search/..." --max-results 5
+python3 stalker.py "Some Name" "https://arxiv.org/search/..." --max-results 5
+```
+
+Batch mode (recommended: TOML):
+
+```bash
+python3 stalker.py --config targets.toml
+```
+
+Example `targets.toml`:
+
+```toml
+[[targets]]
+name = "Example One"
+url = "https://arxiv.org/search/math?searchtype=author&query=..."
+
+[[targets]]
+name = "Example Two"
+url = "https://arxiv.org/search/cs?searchtype=all&query=..."
+```
+
+YAML is also supported if PyYAML is installed (`pip install pyyaml`). Example `targets.yaml`:
+
+```yaml
+targets:
+  - name: "Example One"
+    url: "https://arxiv.org/search/math?searchtype=author&query=..."
+  - name: "Example Two"
+    url: "https://arxiv.org/search/cs?searchtype=all&query=..."
 ```
 
 ## Output Layout
@@ -60,7 +88,7 @@ Inside the output folder:
 
 ### 1) Discover arXiv IDs from the search URL
 
-The provided `url` should be an arXiv search results page (e.g. `/search/...`).
+Each provided `url` should be an arXiv search results page (e.g. `/search/...`).
 
 The script:
 

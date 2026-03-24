@@ -1,8 +1,23 @@
 #!/usr/bin/env python3
-"""Fetch all arXiv PDFs listed by a search URL.
+"""Fetch arXiv PDFs listed by one or more search URLs.
 
 Usage:
-  python fetch_arxiv_pdfs.py "della Corte" "https://arxiv.org/search/math?searchtype=author&query=Della+Corte,+A"
+  python3 stalker.py "Some Name" "https://arxiv.org/search/..."
+
+Batch mode (TOML recommended):
+  python3 stalker.py --config targets.toml
+
+Config format examples:
+
+  TOML (Python 3.11+):
+    [[targets]]
+    name = "Example"
+    url = "https://arxiv.org/search/..."
+
+  YAML (requires PyYAML):
+    targets:
+      - name: "Example"
+        url: "https://arxiv.org/search/..."
 
 Behavior:
   - Creates an output folder named {SANITIZED_NAME}_resources (uppercase, spaces -> underscores).
@@ -32,7 +47,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 ATOM_NS = {
@@ -401,50 +416,119 @@ def download_pdf(
     raise last_err
 
 
-def main() -> int:
-    p = argparse.ArgumentParser(description="Fetch arXiv PDFs from a search URL")
-    p.add_argument("name", help="Name used to create output folder")
-    p.add_argument("url", help="arXiv search URL")
-    p.add_argument("--delay", type=float, default=1.0, help="Delay between requests (seconds)")
-    p.add_argument("--page-size", type=int, default=200, help="Search results page size")
-    p.add_argument("--batch-size", type=int, default=50, help="arXiv API id_list batch size")
-    p.add_argument("--max-results", type=int, default=None, help="Stop after N papers")
-    p.add_argument("--timeout", type=int, default=30, help="HTTP timeout (seconds)")
-    p.add_argument("--retries", type=int, default=3, help="Retries per request")
-    args = p.parse_args()
+def load_targets_from_file(path: str) -> List[Tuple[str, str]]:
+    """Load name/url pairs from a TOML or YAML file.
 
-    user_agent = "stalker-arxiv-fetch/1.0 (+https://arxiv.org)"
+    Supported structures:
+      - TOML:
+          [[targets]]
+          name = "..."
+          url = "..."
 
-    out_dir = f"{sanitize_folder_name(args.name)}_resources"
+      - YAML:
+          targets:
+            - name: "..."
+              url: "..."
+
+        or a top-level list of {name, url}.
+    """
+
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".toml":
+        try:
+            import tomllib  # type: ignore
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError("TOML config requires Python 3.11+ (tomllib)") from e
+        with open(path, "rb") as f:
+            obj = tomllib.load(f)
+    elif ext in (".yaml", ".yml"):
+        try:
+            import yaml  # type: ignore
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(
+                "YAML config requires PyYAML (pip install pyyaml). "
+                "Alternatively use TOML (recommended)."
+            ) from e
+        with open(path, "r", encoding="utf-8") as f:
+            obj = yaml.safe_load(f)
+    else:
+        raise RuntimeError(f"Unsupported config extension: {ext} (use .toml or .yaml/.yml)")
+
+    if isinstance(obj, dict) and "targets" in obj:
+        items = obj["targets"]
+    else:
+        items = obj
+
+    if not isinstance(items, list):
+        raise RuntimeError("Config must be a list of targets or a dict with a 'targets' list")
+
+    out: List[Tuple[str, str]] = []
+    for i, it in enumerate(items, start=1):
+        if isinstance(it, dict):
+            name = it.get("name")
+            url = it.get("url")
+        elif isinstance(it, (list, tuple)) and len(it) == 2:
+            name, url = it
+        else:
+            raise RuntimeError(f"Invalid target at index {i}; expected {{name,url}}")
+
+        if not isinstance(name, str) or not name.strip():
+            raise RuntimeError(f"Invalid or missing 'name' at index {i}")
+        if not isinstance(url, str) or not url.strip():
+            raise RuntimeError(f"Invalid or missing 'url' at index {i}")
+        out.append((name.strip(), url.strip()))
+
+    return out
+
+
+def run_single_target(
+    name: str,
+    url: str,
+    *,
+    timeout: int,
+    user_agent: str,
+    retries: int,
+    page_size: int,
+    delay: float,
+    max_results: Optional[int],
+    batch_size: int,
+) -> Tuple[int, int]:
+    """Run one name/url pair. Returns (exit_code, failed_count)."""
+
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.netloc.lower() == "arxiv.org" and parsed.path.startswith("/search/") and parsed.path != "/search/":
+        archive = parsed.path[len("/search/") :].strip("/")
+        if archive:
+            print(f"Note: URL searches only archive '{archive}'. Use https://arxiv.org/search/?... for all archives.")
+
+    out_dir = f"{sanitize_folder_name(name)}_resources"
     ensure_dir(out_dir)
     ledger_path = os.path.join(out_dir, "metadata.jsonl")
-
     existing = load_jsonl_latest(ledger_path)
 
     ids = discover_arxiv_ids(
-        args.url,
-        timeout=args.timeout,
+        url,
+        timeout=timeout,
         user_agent=user_agent,
-        retries=args.retries,
-        page_size=args.page_size,
-        delay=args.delay,
-        max_results=args.max_results,
+        retries=retries,
+        page_size=page_size,
+        delay=delay,
+        max_results=max_results,
     )
     if not ids:
         print("No arXiv ids found at the provided URL")
-        return 2
+        return 2, 1
 
     meta = fetch_metadata_for_ids(
         ids,
-        timeout=args.timeout,
+        timeout=timeout,
         user_agent=user_agent,
-        retries=args.retries,
-        batch_size=args.batch_size,
-        delay=args.delay,
+        retries=retries,
+        batch_size=batch_size,
+        delay=delay,
     )
 
     claimed: Dict[str, str] = {}
-    # Pre-fill claimed from existing ledger to keep filenames stable.
     for arxiv_id, rec in existing.items():
         fn = rec.get("filename")
         if isinstance(fn, str) and fn:
@@ -457,12 +541,11 @@ def main() -> int:
     for arxiv_id in ids:
         item = meta.get(arxiv_id)
         if item is None:
-            # If API didn't return it (rare), still record that we saw it.
             append_jsonl(
                 ledger_path,
                 {
                     "arxiv_id": arxiv_id,
-                    "source_search_url": args.url,
+                    "source_search_url": url,
                     "seen_at": now_iso(),
                     "status": "missing_metadata",
                 },
@@ -477,6 +560,7 @@ def main() -> int:
         else:
             filename = choose_filename(item, out_dir=out_dir, claimed=claimed)
         dest_path = os.path.join(out_dir, filename)
+
         if prev.get("downloaded") is True and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
             skipped += 1
             continue
@@ -488,7 +572,7 @@ def main() -> int:
             "title": item.title,
             "authors": item.authors,
             "filename": filename,
-            "source_search_url": args.url,
+            "source_search_url": url,
         }
         append_jsonl(
             ledger_path,
@@ -504,9 +588,9 @@ def main() -> int:
             nbytes, sha256_hex = download_pdf(
                 item.pdf_url,
                 dest_path,
-                timeout=args.timeout,
+                timeout=timeout,
                 user_agent=user_agent,
-                retries=args.retries,
+                retries=retries,
                 base_backoff=1.0,
             )
             append_jsonl(
@@ -534,15 +618,73 @@ def main() -> int:
             )
             failed += 1
 
-        if args.delay:
-            time.sleep(args.delay)
+        if delay:
+            time.sleep(delay)
 
     print(f"Output folder: {out_dir}")
     print(f"Discovered: {len(ids)}")
     print(f"Downloaded: {downloaded}")
     print(f"Skipped: {skipped}")
     print(f"Failed: {failed}")
-    return 0 if failed == 0 else 1
+    return (0 if failed == 0 else 1), failed
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="Fetch arXiv PDFs from arXiv search URLs")
+    p.add_argument("name", nargs="?", help="Name used to create output folder")
+    p.add_argument("url", nargs="?", help="arXiv search URL")
+    p.add_argument(
+        "--config",
+        help="Path to a TOML or YAML file listing name/url pairs",
+        default=None,
+    )
+    p.add_argument("--delay", type=float, default=1.0, help="Delay between requests (seconds)")
+    p.add_argument("--page-size", type=int, default=200, help="Search results page size")
+    p.add_argument("--batch-size", type=int, default=50, help="arXiv API id_list batch size")
+    p.add_argument("--max-results", type=int, default=None, help="Stop after N papers")
+    p.add_argument("--timeout", type=int, default=30, help="HTTP timeout (seconds)")
+    p.add_argument("--retries", type=int, default=3, help="Retries per request")
+    p.add_argument(
+        "--stop-on-error",
+        action="store_true",
+        help="Stop processing targets after the first target with failures",
+    )
+    args = p.parse_args()
+
+    user_agent = "stalker/1.0 (+https://arxiv.org)"
+
+    targets: List[Tuple[str, str]] = []
+    if args.config:
+        targets.extend(load_targets_from_file(args.config))
+
+    if args.name and args.url:
+        targets.append((args.name, args.url))
+    elif args.name or args.url:
+        p.error("Provide both name and url, or neither (use --config).")
+
+    if not targets:
+        p.error("No targets provided. Pass name+url or --config.")
+
+    any_failed = False
+    for idx, (name, url) in enumerate(targets, start=1):
+        print(f"Target {idx}/{len(targets)}: {name}")
+        rc, failed = run_single_target(
+            name,
+            url,
+            timeout=args.timeout,
+            user_agent=user_agent,
+            retries=args.retries,
+            page_size=args.page_size,
+            delay=args.delay,
+            max_results=args.max_results,
+            batch_size=args.batch_size,
+        )
+        if rc != 0:
+            any_failed = True
+            if args.stop_on_error and failed:
+                break
+
+    return 0 if not any_failed else 1
 
 
 if __name__ == "__main__":

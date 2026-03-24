@@ -36,3 +36,8 @@ Thumbs.db
 
 # Temporary download parts
 *.part
+
+# Local config files (use the example template instead)
+targets.toml
+targets.yaml
+targets.yml
