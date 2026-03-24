@@ -1,4 +1,6 @@
-# arXiv PDF Fetcher
+# stalker: an arXiv PDF Fetcher for the obsessed mathematician
+
+![koer](koer.jpeg)
 
 This repository contains a single, standalone Python script (`stalker.py`) that:
 
