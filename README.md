@@ -1,4 +1,4 @@
-# stalker: an arXiv PDF Fetcher for the obsessed mathematician
+# stalker: an arXiv PDF fetcher for the overly attached mathematician
 
 ![koer](koer.jpeg)
 
