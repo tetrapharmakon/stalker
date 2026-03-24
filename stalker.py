@@ -35,9 +35,11 @@ This script uses only the Python standard library.
 from __future__ import annotations
 
 import argparse
+import email.utils
 import hashlib
 import json
 import os
+import random
 import re
 import time
 import unicodedata
@@ -143,6 +145,37 @@ def request_bytes(url: str, *, timeout: int, user_agent: str) -> bytes:
         return resp.read()
 
 
+def _retry_after_seconds(err: urllib.error.HTTPError) -> Optional[float]:
+    ra = None
+    try:
+        ra = err.headers.get("Retry-After")
+    except Exception:  # noqa: BLE001
+        ra = None
+    if not ra:
+        return None
+
+    ra = str(ra).strip()
+    if not ra:
+        return None
+
+    # Retry-After can be seconds or an HTTP date.
+    try:
+        return float(int(ra))
+    except ValueError:
+        pass
+
+    try:
+        dt = email.utils.parsedate_to_datetime(ra)
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        delta = (dt - datetime.now(timezone.utc)).total_seconds()
+        return max(0.0, float(delta))
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def fetch_with_retries(
     url: str,
     *,
@@ -158,6 +191,14 @@ def fetch_with_retries(
         except urllib.error.HTTPError as e:
             last_err = e
             status = getattr(e, "code", None)
+            if status == 429 and attempt < retries:
+                ra = _retry_after_seconds(e)
+                # Respect Retry-After when available, otherwise exponential backoff.
+                sleep_s = ra if ra is not None else (base_backoff * (2 ** (attempt - 1)))
+                # small jitter to avoid sync retries
+                sleep_s = max(0.5, sleep_s) + random.random() * 0.25
+                time.sleep(sleep_s)
+                continue
             if status in (404, 400, 401, 403):
                 raise
         except (urllib.error.URLError, TimeoutError) as e:
@@ -165,6 +206,7 @@ def fetch_with_retries(
 
         if attempt < retries:
             sleep_s = base_backoff * (2 ** (attempt - 1))
+            sleep_s = sleep_s + random.random() * 0.25
             time.sleep(sleep_s)
 
     assert last_err is not None
@@ -204,6 +246,7 @@ def discover_arxiv_ids(
     seen: set[str] = set()
 
     start = 0
+    prev_page_ids: Optional[List[str]] = None
     while True:
         page_url = set_query_param(set_query_param(url, "size", str(page_size)), "start", str(start))
         raw = fetch_with_retries(
@@ -216,6 +259,16 @@ def discover_arxiv_ids(
         html = raw.decode("utf-8", errors="replace")
         page_ids = extract_arxiv_ids_from_html(html)
 
+        if prev_page_ids is not None and page_ids == prev_page_ids:
+            raise RuntimeError(
+                "Pagination did not advance (received identical result page twice). "
+                "Try a smaller --page-size and a larger --delay, or verify the URL."
+            )
+        prev_page_ids = page_ids
+
+        if not page_ids:
+            break
+
         new_ids = [i for i in page_ids if i not in seen]
         if not new_ids:
             break
@@ -226,7 +279,8 @@ def discover_arxiv_ids(
             if max_results is not None and len(all_ids) >= max_results:
                 return all_ids[:max_results]
 
-        start += page_size
+        # Advance by what the server actually returned; arXiv may cap page sizes.
+        start += len(page_ids)
         if delay:
             time.sleep(delay)
 
@@ -279,7 +333,14 @@ def fetch_metadata_for_ids(
     for idx in range(0, len(ids), batch_size):
         batch = ids[idx : idx + batch_size]
         id_list = ",".join(batch)
-        api_url = f"https://export.arxiv.org/api/query?id_list={urllib.parse.quote(id_list)}"
+        # arXiv API defaults to returning only 10 results unless max_results is set.
+        # Even when using id_list, specify max_results to ensure the full batch is returned.
+        params = {
+            "id_list": id_list,
+            "start": "0",
+            "max_results": str(len(batch)),
+        }
+        api_url = "https://export.arxiv.org/api/query?" + urllib.parse.urlencode(params)
         xml_bytes = fetch_with_retries(
             api_url,
             timeout=timeout,
@@ -398,6 +459,12 @@ def download_pdf(
         except urllib.error.HTTPError as e:
             last_err = e
             status = getattr(e, "code", None)
+            if status == 429 and attempt < retries:
+                ra = _retry_after_seconds(e)
+                sleep_s = ra if ra is not None else (base_backoff * (2 ** (attempt - 1)))
+                sleep_s = max(0.5, sleep_s) + random.random() * 0.25
+                time.sleep(sleep_s)
+                continue
             if status in (404, 400, 401, 403):
                 break
         except (urllib.error.URLError, TimeoutError, RuntimeError) as e:
@@ -410,7 +477,7 @@ def download_pdf(
             pass
 
         if attempt < retries:
-            time.sleep(base_backoff * (2 ** (attempt - 1)))
+            time.sleep(base_backoff * (2 ** (attempt - 1)) + random.random() * 0.25)
 
     assert last_err is not None
     raise last_err
@@ -492,6 +559,7 @@ def run_single_target(
     delay: float,
     max_results: Optional[int],
     batch_size: int,
+    dry_run: bool,
 ) -> Tuple[int, int]:
     """Run one name/url pair. Returns (exit_code, failed_count)."""
 
@@ -506,27 +574,40 @@ def run_single_target(
     ledger_path = os.path.join(out_dir, "metadata.jsonl")
     existing = load_jsonl_latest(ledger_path)
 
-    ids = discover_arxiv_ids(
-        url,
-        timeout=timeout,
-        user_agent=user_agent,
-        retries=retries,
-        page_size=page_size,
-        delay=delay,
-        max_results=max_results,
-    )
+    try:
+        ids = discover_arxiv_ids(
+            url,
+            timeout=timeout,
+            user_agent=user_agent,
+            retries=retries,
+            page_size=page_size,
+            delay=delay,
+            max_results=max_results,
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"Discovery failed: {type(e).__name__}: {e}")
+        return 1, 1
     if not ids:
         print("No arXiv ids found at the provided URL")
         return 2, 1
 
-    meta = fetch_metadata_for_ids(
-        ids,
-        timeout=timeout,
-        user_agent=user_agent,
-        retries=retries,
-        batch_size=batch_size,
-        delay=delay,
-    )
+    if dry_run:
+        print(f"Output folder: {out_dir}")
+        print(f"Discovered: {len(ids)}")
+        return 0, 0
+
+    try:
+        meta = fetch_metadata_for_ids(
+            ids,
+            timeout=timeout,
+            user_agent=user_agent,
+            retries=retries,
+            batch_size=batch_size,
+            delay=delay,
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"Metadata fetch failed: {type(e).__name__}: {e}")
+        return 1, 1
 
     claimed: Dict[str, str] = {}
     for arxiv_id, rec in existing.items():
@@ -638,18 +719,32 @@ def main() -> int:
         help="Path to a TOML or YAML file listing name/url pairs",
         default=None,
     )
-    p.add_argument("--delay", type=float, default=1.0, help="Delay between requests (seconds)")
-    p.add_argument("--page-size", type=int, default=200, help="Search results page size")
+    p.add_argument("--delay", type=float, default=2.0, help="Delay between requests (seconds)")
+    p.add_argument(
+        "--page-size",
+        type=int,
+        default=25,
+        help="Search results page size (25, 50, 100, or 200)",
+    )
     p.add_argument("--batch-size", type=int, default=50, help="arXiv API id_list batch size")
     p.add_argument("--max-results", type=int, default=None, help="Stop after N papers")
     p.add_argument("--timeout", type=int, default=30, help="HTTP timeout (seconds)")
-    p.add_argument("--retries", type=int, default=3, help="Retries per request")
+    p.add_argument("--retries", type=int, default=5, help="Retries per request")
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Discover counts per target without downloading PDFs",
+    )
     p.add_argument(
         "--stop-on-error",
         action="store_true",
         help="Stop processing targets after the first target with failures",
     )
     args = p.parse_args()
+
+    allowed_page_sizes = {25, 50, 100, 200}
+    if args.page_size not in allowed_page_sizes:
+        p.error("--page-size must be one of: 25, 50, 100, 200")
 
     user_agent = "stalker/1.0 (+https://arxiv.org)"
 
@@ -678,6 +773,7 @@ def main() -> int:
             delay=args.delay,
             max_results=args.max_results,
             batch_size=args.batch_size,
+            dry_run=args.dry_run,
         )
         if rc != 0:
             any_failed = True

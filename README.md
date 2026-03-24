@@ -26,11 +26,17 @@ Common options:
 
 ```bash
 python3 stalker.py "Some Name" "https://arxiv.org/search/..." \
-  --delay 1.0 \
-  --page-size 200 \
+  --delay 2.0 \
+  --page-size 25 \
   --batch-size 50 \
   --timeout 30 \
-  --retries 3
+  --retries 5
+```
+
+Dry run (discover counts only):
+
+```bash
+python3 stalker.py --config targets.toml --dry-run
 ```
 
 Optional limit (useful for testing):
@@ -104,6 +110,8 @@ Only the identifiers are taken from HTML. Titles and authors are not parsed from
 For each discovered arXiv id, the script queries the Atom API:
 
 - `https://export.arxiv.org/api/query?id_list=<comma-separated-ids>`
+
+Note: the arXiv API defaults to returning 10 entries unless `max_results` is provided; the script sets `max_results` to the batch size to ensure the full batch is returned.
 
 It parses the Atom XML and records:
 
