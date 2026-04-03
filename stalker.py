@@ -104,13 +104,13 @@ def sanitize_author(author: str) -> str:
     - ASCII fold
     - Uppercase
     - Split into alnum tokens
-    - Drop tokens with length == 2
+    - Drop single-character tokens (bare initials)
     - Join with underscores
     """
 
     s = ascii_fold(author).upper()
     s = re.sub(r"[^A-Z0-9]+", " ", s)
-    tokens = [t for t in s.split() if t and len(t) != 2]
+    tokens = [t for t in s.split() if t and len(t) > 1]
     s = "_".join(tokens)
     s = re.sub(r"_+", "_", s).strip("_")
     return s or "UNKNOWN"
