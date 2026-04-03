@@ -320,6 +320,7 @@ class ArxivItem:
     arxiv_id: str
     title: str
     authors: List[str]
+    abstract: str = ""
 
     @property
     def pdf_url(self) -> str:
@@ -343,8 +344,10 @@ def parse_atom_feed(xml_bytes: bytes) -> List[ArxivItem]:
             nm = a.findtext("atom:name", default="", namespaces=ATOM_NS).strip()
             if nm:
                 authors.append(nm)
+        abstract = entry.findtext("atom:summary", default="", namespaces=ATOM_NS)
+        abstract = " ".join((abstract or "").split())
         if arxiv_id:
-            items.append(ArxivItem(arxiv_id=arxiv_id, title=title, authors=authors))
+            items.append(ArxivItem(arxiv_id=arxiv_id, title=title, authors=authors, abstract=abstract))
     return items
 
 
@@ -564,6 +567,26 @@ def load_targets_from_file(path: str) -> List[Tuple[str, str]]:
     return out
 
 
+def _write_digest(out_dir: str, new_items: List[ArxivItem]) -> Optional[str]:
+    """Write a markdown digest of newly downloaded papers. Returns path or None."""
+    if not new_items:
+        return None
+    digest_path = os.path.join(out_dir, "digest.md")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    lines = [f"# New papers — {today}\n"]
+    for item in new_items:
+        authors_str = ", ".join(item.authors) if item.authors else "Unknown"
+        lines.append(f"## {item.title}\n")
+        lines.append(f"**{authors_str}**\n")
+        lines.append(f"{item.abs_url}\n")
+        if item.abstract:
+            lines.append(f"\n> {item.abstract}\n")
+        lines.append("")
+    with open(digest_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return digest_path
+
+
 def run_single_target(
     name: str,
     url: str,
@@ -635,6 +658,7 @@ def run_single_target(
     downloaded = 0
     skipped = 0
     failed = 0
+    new_items: List[ArxivItem] = []
 
     for arxiv_id in ids:
         item = meta.get(arxiv_id)
@@ -671,6 +695,7 @@ def run_single_target(
             "pdf_url": item.pdf_url,
             "title": item.title,
             "authors": item.authors,
+            "abstract": item.abstract,
             "filename": filename,
             "source_search_url": url,
         }
@@ -705,6 +730,7 @@ def run_single_target(
                 },
             )
             downloaded += 1
+            new_items.append(item)
             log.info("[%s] ok -> %s", arxiv_id, filename)
         except Exception as e:  # noqa: BLE001
             append_jsonl(
@@ -726,6 +752,12 @@ def run_single_target(
     log.info("Output folder: %s", out_dir)
     log.info("Discovered: %d | Downloaded: %d | Skipped: %d | Failed: %d",
              len(ids), downloaded, skipped, failed)
+
+    digest_path = _write_digest(out_dir, new_items)
+    if digest_path:
+        log.info("Digest: %s (%d new paper%s)", digest_path, len(new_items),
+                 "s" if len(new_items) != 1 else "")
+
     return (0 if failed == 0 else 1), failed
 
 
