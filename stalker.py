@@ -176,6 +176,53 @@ def _retry_after_seconds(err: urllib.error.HTTPError) -> Optional[float]:
         return None
 
 
+def _run_with_retries(
+    action,
+    *,
+    retries: int,
+    base_backoff: float,
+    extra_exceptions: tuple = (),
+    on_failure=None,
+):
+    """Generic retry wrapper with exponential backoff and Retry-After support.
+
+    *action* is a zero-argument callable that performs the attempt.
+    *extra_exceptions* are caught alongside URLError/TimeoutError.
+    *on_failure* is called (no args) after each failed attempt (before sleep)
+    for cleanup such as removing partial files.
+    """
+    last_err: Optional[BaseException] = None
+    caught = (urllib.error.URLError, TimeoutError) + extra_exceptions
+    for attempt in range(1, retries + 1):
+        try:
+            return action()
+        except urllib.error.HTTPError as e:
+            last_err = e
+            status = getattr(e, "code", None)
+            if status == 429 and attempt < retries:
+                ra = _retry_after_seconds(e)
+                sleep_s = ra if ra is not None else (base_backoff * (2 ** (attempt - 1)))
+                sleep_s = max(0.5, sleep_s) + random.random() * 0.25
+                time.sleep(sleep_s)
+                if on_failure:
+                    on_failure()
+                continue
+            if status in (404, 400, 401, 403):
+                raise
+        except caught as e:
+            last_err = e
+
+        if on_failure:
+            on_failure()
+        if attempt < retries:
+            sleep_s = base_backoff * (2 ** (attempt - 1)) + random.random() * 0.25
+            time.sleep(sleep_s)
+
+    if last_err is None:
+        raise RuntimeError("retry loop exited without an error")
+    raise last_err
+
+
 def fetch_with_retries(
     url: str,
     *,
@@ -184,33 +231,11 @@ def fetch_with_retries(
     retries: int,
     base_backoff: float,
 ) -> bytes:
-    last_err: Optional[BaseException] = None
-    for attempt in range(1, retries + 1):
-        try:
-            return request_bytes(url, timeout=timeout, user_agent=user_agent)
-        except urllib.error.HTTPError as e:
-            last_err = e
-            status = getattr(e, "code", None)
-            if status == 429 and attempt < retries:
-                ra = _retry_after_seconds(e)
-                # Respect Retry-After when available, otherwise exponential backoff.
-                sleep_s = ra if ra is not None else (base_backoff * (2 ** (attempt - 1)))
-                # small jitter to avoid sync retries
-                sleep_s = max(0.5, sleep_s) + random.random() * 0.25
-                time.sleep(sleep_s)
-                continue
-            if status in (404, 400, 401, 403):
-                raise
-        except (urllib.error.URLError, TimeoutError) as e:
-            last_err = e
-
-        if attempt < retries:
-            sleep_s = base_backoff * (2 ** (attempt - 1))
-            sleep_s = sleep_s + random.random() * 0.25
-            time.sleep(sleep_s)
-
-    assert last_err is not None
-    raise last_err
+    return _run_with_retries(
+        lambda: request_bytes(url, timeout=timeout, user_agent=user_agent),
+        retries=retries,
+        base_backoff=base_backoff,
+    )
 
 
 def extract_arxiv_ids_from_html(html: str) -> List[str]:
@@ -426,61 +451,49 @@ def download_pdf(
 ) -> Tuple[int, str]:
     """Download a PDF to dest_path. Returns (bytes_written, sha256_hex)."""
     part_path = dest_path + ".part"
-    last_err: Optional[BaseException] = None
-    for attempt in range(1, retries + 1):
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": user_agent})
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                ctype = (resp.headers.get("Content-Type") or "").lower()
-                # arXiv sometimes serves application/pdf; allow unknown.
-                if ctype and "pdf" not in ctype and "octet-stream" not in ctype:
-                    raise RuntimeError(f"Unexpected content-type: {ctype}")
 
-                h = hashlib.sha256()
-                total = 0
-                with open(part_path, "wb") as out:
-                    first = resp.read(5)
-                    if not first.startswith(b"%PDF"):
-                        raise RuntimeError("Response does not look like a PDF")
-                    out.write(first)
-                    h.update(first)
-                    total += len(first)
-
-                    while True:
-                        chunk = resp.read(1024 * 64)
-                        if not chunk:
-                            break
-                        out.write(chunk)
-                        h.update(chunk)
-                        total += len(chunk)
-
-            os.replace(part_path, dest_path)
-            return total, h.hexdigest()
-        except urllib.error.HTTPError as e:
-            last_err = e
-            status = getattr(e, "code", None)
-            if status == 429 and attempt < retries:
-                ra = _retry_after_seconds(e)
-                sleep_s = ra if ra is not None else (base_backoff * (2 ** (attempt - 1)))
-                sleep_s = max(0.5, sleep_s) + random.random() * 0.25
-                time.sleep(sleep_s)
-                continue
-            if status in (404, 400, 401, 403):
-                break
-        except (urllib.error.URLError, TimeoutError, RuntimeError) as e:
-            last_err = e
-
+    def _cleanup():
         try:
             if os.path.exists(part_path):
                 os.remove(part_path)
         except OSError:
             pass
 
-        if attempt < retries:
-            time.sleep(base_backoff * (2 ** (attempt - 1)) + random.random() * 0.25)
+    def _attempt():
+        req = urllib.request.Request(url, headers={"User-Agent": user_agent})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            if ctype and "pdf" not in ctype and "octet-stream" not in ctype:
+                raise RuntimeError(f"Unexpected content-type: {ctype}")
 
-    assert last_err is not None
-    raise last_err
+            h = hashlib.sha256()
+            total = 0
+            with open(part_path, "wb") as out:
+                first = resp.read(5)
+                if not first.startswith(b"%PDF"):
+                    raise RuntimeError("Response does not look like a PDF")
+                out.write(first)
+                h.update(first)
+                total += len(first)
+
+                while True:
+                    chunk = resp.read(1024 * 64)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    h.update(chunk)
+                    total += len(chunk)
+
+        os.replace(part_path, dest_path)
+        return total, h.hexdigest()
+
+    return _run_with_retries(
+        _attempt,
+        retries=retries,
+        base_backoff=base_backoff,
+        extra_exceptions=(RuntimeError,),
+        on_failure=_cleanup,
+    )
 
 
 def load_targets_from_file(path: str) -> List[Tuple[str, str]]:
