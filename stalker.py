@@ -38,6 +38,7 @@ import argparse
 import email.utils
 import hashlib
 import json
+import logging
 import os
 import random
 import re
@@ -50,6 +51,8 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
+
+log = logging.getLogger("stalker")
 
 
 ATOM_NS = {
@@ -581,7 +584,7 @@ def run_single_target(
     if parsed.netloc.lower() == "arxiv.org" and parsed.path.startswith("/search/") and parsed.path != "/search/":
         archive = parsed.path[len("/search/") :].strip("/")
         if archive:
-            print(f"Note: URL searches only archive '{archive}'. Use https://arxiv.org/search/?... for all archives.")
+            log.warning("URL searches only archive '%s'. Use https://arxiv.org/search/?... for all archives.", archive)
 
     out_dir = f"{sanitize_folder_name(name)}_resources"
     ensure_dir(out_dir)
@@ -599,15 +602,15 @@ def run_single_target(
             max_results=max_results,
         )
     except Exception as e:  # noqa: BLE001
-        print(f"Discovery failed: {type(e).__name__}: {e}")
+        log.error("Discovery failed: %s: %s", type(e).__name__, e)
         return 1, 1
     if not ids:
-        print("No arXiv ids found at the provided URL")
+        log.warning("No arXiv ids found at the provided URL")
         return 2, 1
 
     if dry_run:
-        print(f"Output folder: {out_dir}")
-        print(f"Discovered: {len(ids)}")
+        log.info("Output folder: %s", out_dir)
+        log.info("Discovered: %d", len(ids))
         return 0, 0
 
     try:
@@ -620,7 +623,7 @@ def run_single_target(
             delay=delay,
         )
     except Exception as e:  # noqa: BLE001
-        print(f"Metadata fetch failed: {type(e).__name__}: {e}")
+        log.error("Metadata fetch failed: %s: %s", type(e).__name__, e)
         return 1, 1
 
     claimed: Dict[str, str] = {}
@@ -636,7 +639,7 @@ def run_single_target(
     for arxiv_id in ids:
         item = meta.get(arxiv_id)
         if item is None:
-            print(f"  [{arxiv_id}] FAIL (no metadata)")
+            log.error("[%s] no metadata found", arxiv_id)
             append_jsonl(
                 ledger_path,
                 {
@@ -658,7 +661,7 @@ def run_single_target(
         dest_path = os.path.join(out_dir, filename)
 
         if not force and prev.get("downloaded") is True and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
-            print(f"  [{arxiv_id}] skip (already downloaded)")
+            log.debug("[%s] skip (already downloaded)", arxiv_id)
             skipped += 1
             continue
 
@@ -702,7 +705,7 @@ def run_single_target(
                 },
             )
             downloaded += 1
-            print(f"  [{arxiv_id}] ok -> {filename}")
+            log.info("[%s] ok -> %s", arxiv_id, filename)
         except Exception as e:  # noqa: BLE001
             append_jsonl(
                 ledger_path,
@@ -715,16 +718,14 @@ def run_single_target(
                 },
             )
             failed += 1
-            print(f"  [{arxiv_id}] FAIL ({type(e).__name__}: {e})")
+            log.error("[%s] %s: %s", arxiv_id, type(e).__name__, e)
 
         if delay:
             time.sleep(delay)
 
-    print(f"Output folder: {out_dir}")
-    print(f"Discovered: {len(ids)}")
-    print(f"Downloaded: {downloaded}")
-    print(f"Skipped: {skipped}")
-    print(f"Failed: {failed}")
+    log.info("Output folder: %s", out_dir)
+    log.info("Discovered: %d | Downloaded: %d | Skipped: %d | Failed: %d",
+             len(ids), downloaded, skipped, failed)
     return (0 if failed == 0 else 1), failed
 
 
@@ -763,7 +764,24 @@ def main() -> int:
         action="store_true",
         help="Stop processing targets after the first target with failures",
     )
+    p.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Show debug output (e.g. skipped papers)",
+    )
+    p.add_argument(
+        "-q", "--quiet",
+        action="store_true",
+        help="Only show warnings and errors",
+    )
     args = p.parse_args()
+
+    level = logging.INFO
+    if args.verbose:
+        level = logging.DEBUG
+    elif args.quiet:
+        level = logging.WARNING
+    logging.basicConfig(format="%(message)s", level=level)
 
     allowed_page_sizes = {25, 50, 100, 200}
     if args.page_size not in allowed_page_sizes:
@@ -785,7 +803,7 @@ def main() -> int:
 
     any_failed = False
     for idx, (name, url) in enumerate(targets, start=1):
-        print(f"Target {idx}/{len(targets)}: {name}")
+        log.info("Target %d/%d: %s", idx, len(targets), name)
         rc, failed = run_single_target(
             name,
             url,
