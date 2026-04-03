@@ -573,6 +573,7 @@ def run_single_target(
     max_results: Optional[int],
     batch_size: int,
     dry_run: bool,
+    force: bool,
 ) -> Tuple[int, int]:
     """Run one name/url pair. Returns (exit_code, failed_count)."""
 
@@ -656,7 +657,7 @@ def run_single_target(
             filename = choose_filename(item, out_dir=out_dir, claimed=claimed)
         dest_path = os.path.join(out_dir, filename)
 
-        if prev.get("downloaded") is True and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+        if not force and prev.get("downloaded") is True and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
             print(f"  [{arxiv_id}] skip (already downloaded)")
             skipped += 1
             continue
@@ -753,6 +754,11 @@ def main() -> int:
         help="Discover counts per target without downloading PDFs",
     )
     p.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-download PDFs even if already present (useful for corrupt files)",
+    )
+    p.add_argument(
         "--stop-on-error",
         action="store_true",
         help="Stop processing targets after the first target with failures",
@@ -791,6 +797,7 @@ def main() -> int:
             max_results=args.max_results,
             batch_size=args.batch_size,
             dry_run=args.dry_run,
+            force=args.force,
         )
         if rc != 0:
             any_failed = True
