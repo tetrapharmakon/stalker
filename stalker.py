@@ -635,6 +635,7 @@ def run_single_target(
     for arxiv_id in ids:
         item = meta.get(arxiv_id)
         if item is None:
+            print(f"  [{arxiv_id}] FAIL (no metadata)")
             append_jsonl(
                 ledger_path,
                 {
@@ -656,6 +657,7 @@ def run_single_target(
         dest_path = os.path.join(out_dir, filename)
 
         if prev.get("downloaded") is True and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+            print(f"  [{arxiv_id}] skip (already downloaded)")
             skipped += 1
             continue
 
@@ -699,6 +701,7 @@ def run_single_target(
                 },
             )
             downloaded += 1
+            print(f"  [{arxiv_id}] ok -> {filename}")
         except Exception as e:  # noqa: BLE001
             append_jsonl(
                 ledger_path,
@@ -711,6 +714,7 @@ def run_single_target(
                 },
             )
             failed += 1
+            print(f"  [{arxiv_id}] FAIL ({type(e).__name__}: {e})")
 
         if delay:
             time.sleep(delay)
