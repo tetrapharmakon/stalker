@@ -38,6 +38,7 @@ import argparse
 import email.utils
 import hashlib
 import json
+import logging
 import os
 import random
 import re
@@ -50,6 +51,8 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
+
+log = logging.getLogger("stalker")
 
 
 ATOM_NS = {
@@ -104,13 +107,13 @@ def sanitize_author(author: str) -> str:
     - ASCII fold
     - Uppercase
     - Split into alnum tokens
-    - Drop tokens with length == 2
+    - Drop single-character tokens (bare initials)
     - Join with underscores
     """
 
     s = ascii_fold(author).upper()
     s = re.sub(r"[^A-Z0-9]+", " ", s)
-    tokens = [t for t in s.split() if t and len(t) != 2]
+    tokens = [t for t in s.split() if t and len(t) > 1]
     s = "_".join(tokens)
     s = re.sub(r"_+", "_", s).strip("_")
     return s or "UNKNOWN"
@@ -176,6 +179,53 @@ def _retry_after_seconds(err: urllib.error.HTTPError) -> Optional[float]:
         return None
 
 
+def _run_with_retries(
+    action,
+    *,
+    retries: int,
+    base_backoff: float,
+    extra_exceptions: tuple = (),
+    on_failure=None,
+):
+    """Generic retry wrapper with exponential backoff and Retry-After support.
+
+    *action* is a zero-argument callable that performs the attempt.
+    *extra_exceptions* are caught alongside URLError/TimeoutError.
+    *on_failure* is called (no args) after each failed attempt (before sleep)
+    for cleanup such as removing partial files.
+    """
+    last_err: Optional[BaseException] = None
+    caught = (urllib.error.URLError, TimeoutError) + extra_exceptions
+    for attempt in range(1, retries + 1):
+        try:
+            return action()
+        except urllib.error.HTTPError as e:
+            last_err = e
+            status = getattr(e, "code", None)
+            if status == 429 and attempt < retries:
+                ra = _retry_after_seconds(e)
+                sleep_s = ra if ra is not None else (base_backoff * (2 ** (attempt - 1)))
+                sleep_s = max(0.5, sleep_s) + random.random() * 0.25
+                time.sleep(sleep_s)
+                if on_failure:
+                    on_failure()
+                continue
+            if status in (404, 400, 401, 403):
+                raise
+        except caught as e:
+            last_err = e
+
+        if on_failure:
+            on_failure()
+        if attempt < retries:
+            sleep_s = base_backoff * (2 ** (attempt - 1)) + random.random() * 0.25
+            time.sleep(sleep_s)
+
+    if last_err is None:
+        raise RuntimeError("retry loop exited without an error")
+    raise last_err
+
+
 def fetch_with_retries(
     url: str,
     *,
@@ -184,33 +234,11 @@ def fetch_with_retries(
     retries: int,
     base_backoff: float,
 ) -> bytes:
-    last_err: Optional[BaseException] = None
-    for attempt in range(1, retries + 1):
-        try:
-            return request_bytes(url, timeout=timeout, user_agent=user_agent)
-        except urllib.error.HTTPError as e:
-            last_err = e
-            status = getattr(e, "code", None)
-            if status == 429 and attempt < retries:
-                ra = _retry_after_seconds(e)
-                # Respect Retry-After when available, otherwise exponential backoff.
-                sleep_s = ra if ra is not None else (base_backoff * (2 ** (attempt - 1)))
-                # small jitter to avoid sync retries
-                sleep_s = max(0.5, sleep_s) + random.random() * 0.25
-                time.sleep(sleep_s)
-                continue
-            if status in (404, 400, 401, 403):
-                raise
-        except (urllib.error.URLError, TimeoutError) as e:
-            last_err = e
-
-        if attempt < retries:
-            sleep_s = base_backoff * (2 ** (attempt - 1))
-            sleep_s = sleep_s + random.random() * 0.25
-            time.sleep(sleep_s)
-
-    assert last_err is not None
-    raise last_err
+    return _run_with_retries(
+        lambda: request_bytes(url, timeout=timeout, user_agent=user_agent),
+        retries=retries,
+        base_backoff=base_backoff,
+    )
 
 
 def extract_arxiv_ids_from_html(html: str) -> List[str]:
@@ -292,6 +320,7 @@ class ArxivItem:
     arxiv_id: str
     title: str
     authors: List[str]
+    abstract: str = ""
 
     @property
     def pdf_url(self) -> str:
@@ -315,8 +344,10 @@ def parse_atom_feed(xml_bytes: bytes) -> List[ArxivItem]:
             nm = a.findtext("atom:name", default="", namespaces=ATOM_NS).strip()
             if nm:
                 authors.append(nm)
+        abstract = entry.findtext("atom:summary", default="", namespaces=ATOM_NS)
+        abstract = " ".join((abstract or "").split())
         if arxiv_id:
-            items.append(ArxivItem(arxiv_id=arxiv_id, title=title, authors=authors))
+            items.append(ArxivItem(arxiv_id=arxiv_id, title=title, authors=authors, abstract=abstract))
     return items
 
 
@@ -426,61 +457,49 @@ def download_pdf(
 ) -> Tuple[int, str]:
     """Download a PDF to dest_path. Returns (bytes_written, sha256_hex)."""
     part_path = dest_path + ".part"
-    last_err: Optional[BaseException] = None
-    for attempt in range(1, retries + 1):
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": user_agent})
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                ctype = (resp.headers.get("Content-Type") or "").lower()
-                # arXiv sometimes serves application/pdf; allow unknown.
-                if ctype and "pdf" not in ctype and "octet-stream" not in ctype:
-                    raise RuntimeError(f"Unexpected content-type: {ctype}")
 
-                h = hashlib.sha256()
-                total = 0
-                with open(part_path, "wb") as out:
-                    first = resp.read(5)
-                    if not first.startswith(b"%PDF"):
-                        raise RuntimeError("Response does not look like a PDF")
-                    out.write(first)
-                    h.update(first)
-                    total += len(first)
-
-                    while True:
-                        chunk = resp.read(1024 * 64)
-                        if not chunk:
-                            break
-                        out.write(chunk)
-                        h.update(chunk)
-                        total += len(chunk)
-
-            os.replace(part_path, dest_path)
-            return total, h.hexdigest()
-        except urllib.error.HTTPError as e:
-            last_err = e
-            status = getattr(e, "code", None)
-            if status == 429 and attempt < retries:
-                ra = _retry_after_seconds(e)
-                sleep_s = ra if ra is not None else (base_backoff * (2 ** (attempt - 1)))
-                sleep_s = max(0.5, sleep_s) + random.random() * 0.25
-                time.sleep(sleep_s)
-                continue
-            if status in (404, 400, 401, 403):
-                break
-        except (urllib.error.URLError, TimeoutError, RuntimeError) as e:
-            last_err = e
-
+    def _cleanup():
         try:
             if os.path.exists(part_path):
                 os.remove(part_path)
         except OSError:
             pass
 
-        if attempt < retries:
-            time.sleep(base_backoff * (2 ** (attempt - 1)) + random.random() * 0.25)
+    def _attempt():
+        req = urllib.request.Request(url, headers={"User-Agent": user_agent})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            if ctype and "pdf" not in ctype and "octet-stream" not in ctype:
+                raise RuntimeError(f"Unexpected content-type: {ctype}")
 
-    assert last_err is not None
-    raise last_err
+            h = hashlib.sha256()
+            total = 0
+            with open(part_path, "wb") as out:
+                first = resp.read(5)
+                if not first.startswith(b"%PDF"):
+                    raise RuntimeError("Response does not look like a PDF")
+                out.write(first)
+                h.update(first)
+                total += len(first)
+
+                while True:
+                    chunk = resp.read(1024 * 64)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    h.update(chunk)
+                    total += len(chunk)
+
+        os.replace(part_path, dest_path)
+        return total, h.hexdigest()
+
+    return _run_with_retries(
+        _attempt,
+        retries=retries,
+        base_backoff=base_backoff,
+        extra_exceptions=(RuntimeError,),
+        on_failure=_cleanup,
+    )
 
 
 def load_targets_from_file(path: str) -> List[Tuple[str, str]]:
@@ -548,6 +567,26 @@ def load_targets_from_file(path: str) -> List[Tuple[str, str]]:
     return out
 
 
+def _write_digest(out_dir: str, new_items: List[ArxivItem]) -> Optional[str]:
+    """Write a markdown digest of newly downloaded papers. Returns path or None."""
+    if not new_items:
+        return None
+    digest_path = os.path.join(out_dir, "digest.md")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    lines = [f"# New papers — {today}\n"]
+    for item in new_items:
+        authors_str = ", ".join(item.authors) if item.authors else "Unknown"
+        lines.append(f"## {item.title}\n")
+        lines.append(f"**{authors_str}**\n")
+        lines.append(f"{item.abs_url}\n")
+        if item.abstract:
+            lines.append(f"\n> {item.abstract}\n")
+        lines.append("")
+    with open(digest_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return digest_path
+
+
 def run_single_target(
     name: str,
     url: str,
@@ -560,6 +599,7 @@ def run_single_target(
     max_results: Optional[int],
     batch_size: int,
     dry_run: bool,
+    force: bool,
 ) -> Tuple[int, int]:
     """Run one name/url pair. Returns (exit_code, failed_count)."""
 
@@ -567,7 +607,7 @@ def run_single_target(
     if parsed.netloc.lower() == "arxiv.org" and parsed.path.startswith("/search/") and parsed.path != "/search/":
         archive = parsed.path[len("/search/") :].strip("/")
         if archive:
-            print(f"Note: URL searches only archive '{archive}'. Use https://arxiv.org/search/?... for all archives.")
+            log.warning("URL searches only archive '%s'. Use https://arxiv.org/search/?... for all archives.", archive)
 
     out_dir = f"{sanitize_folder_name(name)}_resources"
     ensure_dir(out_dir)
@@ -585,15 +625,15 @@ def run_single_target(
             max_results=max_results,
         )
     except Exception as e:  # noqa: BLE001
-        print(f"Discovery failed: {type(e).__name__}: {e}")
+        log.error("Discovery failed: %s: %s", type(e).__name__, e)
         return 1, 1
     if not ids:
-        print("No arXiv ids found at the provided URL")
+        log.warning("No arXiv ids found at the provided URL")
         return 2, 1
 
     if dry_run:
-        print(f"Output folder: {out_dir}")
-        print(f"Discovered: {len(ids)}")
+        log.info("Output folder: %s", out_dir)
+        log.info("Discovered: %d", len(ids))
         return 0, 0
 
     try:
@@ -606,7 +646,7 @@ def run_single_target(
             delay=delay,
         )
     except Exception as e:  # noqa: BLE001
-        print(f"Metadata fetch failed: {type(e).__name__}: {e}")
+        log.error("Metadata fetch failed: %s: %s", type(e).__name__, e)
         return 1, 1
 
     claimed: Dict[str, str] = {}
@@ -618,10 +658,12 @@ def run_single_target(
     downloaded = 0
     skipped = 0
     failed = 0
+    new_items: List[ArxivItem] = []
 
     for arxiv_id in ids:
         item = meta.get(arxiv_id)
         if item is None:
+            log.error("[%s] no metadata found", arxiv_id)
             append_jsonl(
                 ledger_path,
                 {
@@ -642,7 +684,8 @@ def run_single_target(
             filename = choose_filename(item, out_dir=out_dir, claimed=claimed)
         dest_path = os.path.join(out_dir, filename)
 
-        if prev.get("downloaded") is True and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+        if not force and prev.get("downloaded") is True and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+            log.debug("[%s] skip (already downloaded)", arxiv_id)
             skipped += 1
             continue
 
@@ -652,6 +695,7 @@ def run_single_target(
             "pdf_url": item.pdf_url,
             "title": item.title,
             "authors": item.authors,
+            "abstract": item.abstract,
             "filename": filename,
             "source_search_url": url,
         }
@@ -686,6 +730,8 @@ def run_single_target(
                 },
             )
             downloaded += 1
+            new_items.append(item)
+            log.info("[%s] ok -> %s", arxiv_id, filename)
         except Exception as e:  # noqa: BLE001
             append_jsonl(
                 ledger_path,
@@ -698,15 +744,20 @@ def run_single_target(
                 },
             )
             failed += 1
+            log.error("[%s] %s: %s", arxiv_id, type(e).__name__, e)
 
         if delay:
             time.sleep(delay)
 
-    print(f"Output folder: {out_dir}")
-    print(f"Discovered: {len(ids)}")
-    print(f"Downloaded: {downloaded}")
-    print(f"Skipped: {skipped}")
-    print(f"Failed: {failed}")
+    log.info("Output folder: %s", out_dir)
+    log.info("Discovered: %d | Downloaded: %d | Skipped: %d | Failed: %d",
+             len(ids), downloaded, skipped, failed)
+
+    digest_path = _write_digest(out_dir, new_items)
+    if digest_path:
+        log.info("Digest: %s (%d new paper%s)", digest_path, len(new_items),
+                 "s" if len(new_items) != 1 else "")
+
     return (0 if failed == 0 else 1), failed
 
 
@@ -736,11 +787,33 @@ def main() -> int:
         help="Discover counts per target without downloading PDFs",
     )
     p.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-download PDFs even if already present (useful for corrupt files)",
+    )
+    p.add_argument(
         "--stop-on-error",
         action="store_true",
         help="Stop processing targets after the first target with failures",
     )
+    p.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Show debug output (e.g. skipped papers)",
+    )
+    p.add_argument(
+        "-q", "--quiet",
+        action="store_true",
+        help="Only show warnings and errors",
+    )
     args = p.parse_args()
+
+    level = logging.INFO
+    if args.verbose:
+        level = logging.DEBUG
+    elif args.quiet:
+        level = logging.WARNING
+    logging.basicConfig(format="%(message)s", level=level)
 
     allowed_page_sizes = {25, 50, 100, 200}
     if args.page_size not in allowed_page_sizes:
@@ -762,7 +835,7 @@ def main() -> int:
 
     any_failed = False
     for idx, (name, url) in enumerate(targets, start=1):
-        print(f"Target {idx}/{len(targets)}: {name}")
+        log.info("Target %d/%d: %s", idx, len(targets), name)
         rc, failed = run_single_target(
             name,
             url,
@@ -774,6 +847,7 @@ def main() -> int:
             max_results=args.max_results,
             batch_size=args.batch_size,
             dry_run=args.dry_run,
+            force=args.force,
         )
         if rc != 0:
             any_failed = True
