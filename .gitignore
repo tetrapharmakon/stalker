@@ -3,7 +3,7 @@ __pycache__/
 *.py[cod]
 *.pyd
 .Python
-
+session-ses_2e10.md
 # Virtual environments
 .venv/
 venv/
@@ -32,7 +32,6 @@ Thumbs.db
 *.swo
 
 # Downloads/output folders created by this repo
-*_resources/
 
 # Temporary download parts
 *.part
